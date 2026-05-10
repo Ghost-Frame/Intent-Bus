@@ -2,14 +2,47 @@ services:
   intent-bus:
     build: .
     container_name: intent-bus
+
     ports:
       - "8080:8080"
+
     environment:
+      # --- Required ---
       - BUS_SECRET=change_this_to_a_secure_key
+
+      # --- Admin & Dashboard ---
       - DASHBOARD_PASSWORD=change_this_to_a_secure_password
-      - BUS_MAINTENANCE_MODE=False
+      # - BUS_ADMIN_SECRET=separate_admin_secret_here
+      # - BUS_METRICS_TOKEN=prometheus_bearer_token
+
+      # --- Security & Routing ---
+      # Enable this in production unless HTTPS is terminated by a reverse proxy
+      # - BUS_ENFORCE_HTTPS=true
+
+      # Set true behind nginx/Traefik/Caddy/etc.
+      # - BUS_TRUST_PROXY=true
+
+      # Require HMAC request signing
+      # - BUS_REQUIRE_SIGNATURES=true
+
+      # --- System Maintenance ---
+      - BUS_MAINTENANCE_MODE=false
+      # - BUS_CLEANUP_INTERVAL_SECONDS=21600
+
     volumes:
-      # Persists the SQLite database in a local folder called 'bus_data'
-      # The database survives container restarts and rebuilds
+      # SQLite WAL requires local disk storage.
+      # Do NOT use NFS/EFS/network filesystems.
       - ./bus_data:/app/data
+
     restart: unless-stopped
+
+    stop_grace_period: 30s
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
