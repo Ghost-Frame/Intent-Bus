@@ -4,8 +4,8 @@
 
 | Component | Version | Status |
 | :--- | :--- | :--- |
-| Intent Bus Server | v7.0.1+ | ✅ Supported |
-| Python SDK (`intent-bus`) | v1.1.0+ | ✅ Supported |
+| Intent Bus Server | v7.5+ | ✅ Supported |
+| Python SDK (`intent-bus`) | v1.2.0+ | ✅ Supported |
 
 ---
 
@@ -15,11 +15,17 @@ Intent Bus uses a **Dual-Auth Model** to balance simplicity and security.
 
 ### 1. Standard Authentication
 
-- Requires `X-API-KEY` over HTTPS
-- Protects against passive network interception
+Requires:
 
-**Limitation:**
-- Requests can be replayed if captured by an active attacker
+```http
+X-API-KEY: <key>
+```
+
+Used over HTTPS, this protects against passive network interception.
+
+#### Limitation
+
+Standard authentication does **not** provide replay protection. Captured requests may be replayed by an active attacker.
 
 ---
 
@@ -37,29 +43,61 @@ Provides:
 - Payload integrity
 - Request authenticity
 
-**Recommendation:** Use Strict Auth in all production environments.
+#### Recommendation
+
+Use Strict Auth in all production environments.
+
+Enable globally with:
+
+```bash
+BUS_REQUIRE_SIGNATURES=true
+```
 
 ---
 
 ## Server Operations
 
-### Admin Dashboard Access
+### Admin & Dashboard Access
 
-If the optional dashboard is enabled in `flask_app.py`, it is protected via HTTP Basic Auth:
+Admin endpoints (`/admin/*`) and the dashboard use a separate privileged authentication layer.
 
-- **Username:** `admin` (fixed)
-- **Password:** Set via `DASHBOARD_PASSWORD` environment variable
+Supported methods:
+
+1. Header authentication:
+
+```http
+X-Admin-Token: <BUS_ADMIN_SECRET>
+```
+
+If `BUS_ADMIN_SECRET` is unset, the server falls back to accepting `BUS_SECRET`.
+
+2. HTTP Basic authentication:
+
+```text
+Username: admin
+Password: <DASHBOARD_PASSWORD>
+```
 
 ---
 
 ### Reverse Proxy & HTTPS
 
-The server enforces HTTPS in production using the `X-Forwarded-Proto` header.
+The server can strictly enforce HTTPS in production:
 
-If deploying behind Nginx / Apache:
+```bash
+BUS_ENFORCE_HTTPS=true
+```
 
-- Ensure this header is forwarded correctly
-- Otherwise, requests may be rejected with `403 Forbidden`
+If deploying behind Nginx, Apache, Traefik, or another reverse proxy:
+
+- Ensure `X-Forwarded-Proto` is forwarded correctly
+- Set:
+
+```bash
+BUS_TRUST_PROXY=true
+```
+
+This enables Werkzeug `ProxyFix` support so the server correctly detects secure requests and client IP addresses.
 
 ---
 
@@ -69,14 +107,15 @@ If deploying behind Nginx / Apache:
 
 - Replay attacks (Strict Auth only)
 - Concurrent claim race conditions (SQLite transactional locking)
-- Infinite retry loops (3-attempt limit)
-- Cross-tenant access (API key isolation)
+- Infinite retry loops (configurable max attempts)
+- Cross-tenant access (API key + namespace isolation)
+- Basic denial-of-service abuse (rate limits and payload caps)
 
 ### Not Mitigated
 
 - Malicious or unsafe worker execution
 - Compromised API keys
-- Host-level or VPS compromise
+- Host/VPS compromise
 - Side-channel attacks
 
 ---
@@ -102,9 +141,9 @@ Report privately via:
 
 ### Response Policy
 
-- **Acknowledgement:** within 48 hours  
-- **Initial triage:** within 3–5 days  
-- **Fix timeline:** depends on severity  
+- **Acknowledgement:** within 48 hours
+- **Initial triage:** within 3–5 days
+- **Fix timeline:** depends on severity
 
 Valid reports may receive:
 
@@ -120,8 +159,8 @@ When using Intent Bus:
 - NEVER expose API keys in client-side code
 - ALWAYS use HTTPS
 - USE Strict Auth in production
-- AVOID storing sensitive data in payloads
 - ROTATE API keys periodically
+- AVOID storing sensitive data in payloads
 
 ---
 
@@ -129,10 +168,11 @@ When using Intent Bus:
 
 ### 1. Payload Exposure
 
-- Payloads are **not encrypted at rest**
-- Public intents (`visibility="public"`) can be claimed by any authenticated worker
+Payloads are **not encrypted at rest** within the SQLite database.
 
-**Do NOT include:**
+Public intents (`visibility="public"`) may be claimed by any authenticated worker in the same namespace.
+
+#### Do NOT include:
 
 - API keys
 - Passwords
@@ -144,26 +184,48 @@ When using Intent Bus:
 ### 2. Data Retention
 
 - Intents are ephemeral
-- Completed and expired jobs are pruned automatically
-- KV store values expire via TTL
+- Open intents expire via TTL (default: 24 hours)
+- Fulfilled intents and dead letters are deleted after 7 days during cleanup
+- KV store values expire at their configured TTL
 
 ---
 
-### 3. Concurrency Constraints
+### 3. Hardcoded Limits (Anti-DoS)
 
-- SQLite uses a **single-writer model**
+The following limits are enforced to protect the single-file SQLite architecture:
+
+| Limit | Value |
+| --- | --- |
+| Payload Size | 8KB maximum |
+| Rate Limit | 60 requests / minute |
+| Open Intent Cap | 100 open intents per publisher key |
+
+Admin keys bypass rate limits and open-intent caps.
+
+---
+
+### 4. Concurrency Constraints
+
+SQLite operates using a **single-writer WAL model**.
 
 Under high load:
 
 - Increased latency may occur
-- Requests may fail temporarily (`503 Database Busy`)
+- Requests may temporarily fail with:
+
+```http
+503 Service Unavailable
+```
+
+Clients SHOULD implement retries with backoff.
 
 ---
 
-### 4. Replay Protection Scope
+### 5. Replay Protection Scope
 
-- Enforced **only in Strict Auth**
-- Standard Auth is replayable by design
+Replay protection is enforced **only** when using Strict Auth.
+
+Standard authentication is replayable by design.
 
 ---
 
@@ -171,18 +233,19 @@ Under high load:
 
 The following are NOT considered vulnerabilities:
 
-- Denial of Service via valid requests (rate limits apply)
+- Denial-of-service using valid requests
 - Worker-side execution bugs
-- Unsafe user code (e.g., `eval`)
+- Unsafe user code (e.g. `eval`)
 - API key misuse by authorized users
 - Expected retry behavior
+- SQLite `database is locked` errors under heavy concurrency
 
 ---
 
 ## Disclosure Policy
 
 - Fixes are released before public disclosure
-- Critical patches may be shipped without prior notice
+- Critical patches may be shipped without advance notice
 - Changelogs include relevant security notes when applicable
 
 ---
@@ -191,9 +254,10 @@ The following are NOT considered vulnerabilities:
 
 For security concerns:
 
-- **Email:** dsecurity49@gmail.com  
-- **Discord:** https://discord.gg/bzAneAQzGX  
-  *(DM `dsecurity` for non-sensitive communication)*
+- **Email:** dsecurity49@gmail.com
+- **Discord:** https://discord.gg/bzAneAQzGX
+
+For non-sensitive communication, DM `dsecurity`.
 
 ---
 
