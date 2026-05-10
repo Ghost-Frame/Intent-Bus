@@ -1,14 +1,18 @@
 # RFC: Intent Protocol
-## Version 1.1
+
+## Version 2.0
 
 ### Status
+
 Draft
 
 ### Author
+
 Dsecurity
 
 ### Date
-2026-04-30
+
+2026-05-10
 
 ---
 
@@ -17,10 +21,14 @@ Dsecurity
 The Intent Protocol defines a lightweight, HTTP-based job coordination system for unreliable networks and distributed workers.
 
 It provides:
+
 - At-least-once delivery
-- Atomic job claiming
-- Retry and failure handling
-- Hybrid routing (private and public queues)
+- Atomic job claiming with exponential backoff
+- Priority-based scheduling
+- Namespace isolation
+- Worker capability routing
+- Dead-letter queue
+- Result storage and polling
 - Optional cryptographic request authentication
 
 The protocol is designed to operate without external infrastructure and is suitable for environments ranging from mobile devices to cloud servers.
@@ -31,10 +39,14 @@ The protocol is designed to operate without external infrastructure and is suita
 
 The key words **MUST**, **SHOULD**, and **MAY** are to be interpreted as described in RFC 2119.
 
-- **Intent**: A unit of work submitted to the system.
-- **Worker**: A client that claims and executes intents.
-- **Publisher**: A client that creates intents.
-- **Bus**: The server implementing this protocol.
+| Term | Meaning |
+|---|---|
+| Intent | A unit of work submitted to the system |
+| Worker | A client that claims and executes intents |
+| Publisher | A client that creates intents |
+| Bus | The server implementing this protocol |
+| Dead Letter | An intent that has exhausted all retry attempts |
+| Namespace | A logical partition of intents within the bus |
 
 ---
 
@@ -42,12 +54,14 @@ The key words **MUST**, **SHOULD**, and **MAY** are to be interpreted as describ
 
 The protocol operates over HTTP and defines a shared state machine for job execution.
 
-A publisher submits an Intent.  
-A worker claims it, executes it, and marks it complete.
+A publisher submits an Intent. A worker claims it, executes it, and marks it complete or failed. On failure the bus applies exponential backoff and retries the intent up to a configurable maximum. Intents that exhaust all attempts are moved to a dead-letter queue for inspection and manual retry.
 
 The system guarantees:
+
 - Jobs are not silently lost
-- At-least-once execution (a job MAY be executed more than once; workers MUST be idempotent)
+- At-least-once execution
+
+Because delivery is at-least-once, workers MUST be idempotent. The same intent MAY be executed more than once due to retries, lease expiry, network failures, or lost responses.
 
 ---
 
@@ -57,305 +71,583 @@ The system guarantees:
 
 An Intent MUST exist in one of the following states:
 
-- **open** — Available for claiming  
-- **claimed** — Locked by a worker  
-- **fulfilled** — Successfully completed (terminal)  
-- **failed** — Permanently failed (terminal)  
-
----
+| State | Description |
+|---|---|
+| `open` | Available for claiming |
+| `claimed` | Locked by a worker; has an active lease |
+| `fulfilled` | Successfully completed (terminal) |
+| `dead` | Permanently failed; moved to dead-letter queue (terminal) |
 
 ### 3.2 State Transitions
 
-| From     | To         | Condition |
-|----------|-----------|----------|
-| open     | claimed   | Worker claims job |
-| claimed  | fulfilled | Worker completes job |
-| claimed  | failed    | Worker explicitly fails job |
-| claimed  | open      | Claim timeout expires |
-| claimed  | failed    | Retry limit exceeded |
+| From | To | Trigger |
+|---|---|---|
+| `open` | `claimed` | Worker claims the intent |
+| `claimed` | `fulfilled` | Worker calls `/fulfill/<id>` |
+| `claimed` | `open` | Worker calls `/fail/<id>` and `claim_attempts < max_attempts` |
+| `claimed` | `dead` | Worker calls `/fail/<id>` and `claim_attempts >= max_attempts` |
+| `claimed` | `open` | Lease expires and `claim_attempts < max_attempts` |
+| `claimed` | `dead` | Lease expires and `claim_attempts >= max_attempts` |
+| `dead` | `open` | Admin calls `/admin/intents/<id>/retry` |
+| any | `dead` | Admin calls `/admin/intents/<id>/cancel` |
+
+### 3.3 Retry and Backoff Semantics
+
+- A claim lease MUST expire after `claim_timeout` seconds (default: 60).
+- `claim_attempts` MUST increment atomically when the intent is successfully claimed.
+- On lease expiry or explicit `/fail`, the bus MUST requeue the intent with a backoff delay:
+
+```text
+next_run = now + (backoff_base * (2 ^ claim_attempts)) + jitter
+```
+
+Where `jitter` is a random value in `[0, 2)` seconds to prevent thundering herd.
+
+- A job MUST transition to `dead` when `claim_attempts >= max_attempts`.
+- Default `max_attempts`: 3
+- Default `backoff_base`: 5.0 seconds
+
+If a worker attempts to `/fail` or `/fulfill` an intent after its lease has expired and another worker has reclaimed it, the server MUST reject the operation.
 
 ---
 
-### 3.3 Retry Semantics
+## 4. Intent Fields
 
-- A claim lock MUST expire after a fixed timeout (default: 60 seconds)
-- A job MUST be retried if it is not fulfilled before timeout
-- A job MUST transition to `failed` if:
-  - `claim_attempts >= MAX_ATTEMPTS` (default: 3)
+### 4.1 Publisher-Controlled Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `goal` | string | required | The task type. 1–256 characters. |
+| `payload` | any | required | Arbitrary JSON value passed to the worker. |
+| `namespace` | string | `"default"` | Logical partition. Alphanumeric, `.`, `-`, `_`. Max 64 chars. |
+| `visibility` | string | `"private"` | `"private"` or `"public"`. |
+| `priority` | integer | 100 | 0–1000. Higher values are claimed first. |
+| `delay` | float | 0.0 | Seconds before the intent becomes claimable. |
+| `max_attempts` | integer | 3 | Maximum claim attempts before the intent is dead. 1–20. |
+| `backoff_base` | float | 5.0 | Base for exponential backoff in seconds. 1.0–3600.0. |
+| `target_worker` | string | null | If set, only the worker with this ID can claim the intent. |
+| `required_capability` | string | null | If set, only workers advertising this capability can claim. |
+
+### 4.2 Server-Controlled Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Hex token, 32 characters. |
+| `status` | string | Current state. |
+| `claim_attempts` | integer | Number of times the intent has been claimed. |
+| `claimed_by` | string | API key of the current claimer. |
+| `claimed_at` | float | Unix timestamp of the last claim. |
+| `claim_expires_at` | float | Unix timestamp when the current lease expires. |
+| `run_at` | float | Unix timestamp when the intent becomes claimable. |
+| `created_at` | float | Unix timestamp of creation. |
+| `expires_at` | float | Unix timestamp of TTL expiry. Default: 24 hours. |
+| `last_error` | string | Error message from the last failure, if any. |
+| `result` | any | Stored result from `/fulfill`, if provided. |
+| `result_type` | string | `"json"` or `"text"`. |
+| `completed_at` | float | Unix timestamp of fulfillment. |
 
 ---
 
-## 4. Authentication
+## 5. Authentication
 
-The protocol defines two authentication modes.
+The protocol defines two authentication modes for regular clients, plus a separate admin authentication scheme.
 
-Servers MUST support both.
-
----
-
-### 4.1 Standard Authentication
+### 5.1 Standard Authentication
 
 Clients MUST include:
 
-```
+```text
 X-API-KEY: <key>
 ```
 
 Requirements:
-- MUST be used over HTTPS
-- Provides authentication only (no replay protection)
 
----
+- MUST be used over HTTPS in production
+- Provides authentication only
+- Does not provide replay protection
 
-### 4.2 Strict Authentication (HMAC)
+### 5.2 Strict Authentication (HMAC)
 
 Clients MAY use request signing for enhanced security.
 
----
+Required headers:
 
-### 4.3 Required Headers
-
-```
+```text
 X-API-KEY: <key>
 X-Timestamp: <unix timestamp>
 X-Nonce: <unique value>
 X-Signature: <lowercase hex digest>
 ```
 
----
-
-### 4.4 Validation Rules
-
 Servers MUST:
 
-- Reject timestamps outside ±300 seconds
-- Reject reused nonces per API key
-- Validate HMAC signature
+- Reject timestamps outside ±300 seconds of server time
+- Reject reused nonces within the same 300-second window per API key
+- Validate the HMAC signature
 
-Servers SHOULD:
+#### Signature Construction
 
-- Limit nonce storage to a bounded time window
-- Rely on rate limiting to prevent abuse
+The HMAC-SHA256 signature is computed over the following canonical string using the API key as the secret:
 
----
-
-### 4.5 Signature Construction
-
-The signature MUST be computed as the SHA-256 HMAC of the following payload, using the API key as the secret.
-
-The result MUST be encoded as a lowercase hexadecimal string.
-
-```
-METHOD \n
-CANONICAL_PATH \n
-TIMESTAMP \n
-NONCE \n
+```text
+METHOD
+CANONICAL_PATH
+TIMESTAMP
+NONCE
 BODY
 ```
 
+Rules:
+
 - `METHOD` MUST be uppercase
-- `BODY` MUST be the raw request body (or empty if none)
+- `BODY` MUST be the raw request body bytes
+- Empty bodies MUST serialize as an empty string
+- Query parameters in `CANONICAL_PATH` MUST:
+  - be sorted lexicographically by key
+  - preserve repeated parameters
+  - preserve blank values
+  - be percent-encoded according to RFC 3986
+- The resulting digest MUST be lowercase hexadecimal
+
+### 5.3 Admin Authentication
+
+Admin endpoints are authenticated separately from regular API key auth.
+
+Servers MUST support the following methods in order of precedence:
+
+1. `X-Admin-Token: <secret>`
+2. HTTP Basic authentication with username `admin`
+
+If `BUS_ADMIN_SECRET` is unset, implementations MAY fall back to `BUS_SECRET`.
+
+Admin auth is only required for `/admin/*` endpoints. Regular client endpoints use API key auth.
 
 ---
 
-### 4.6 Canonical Path
+## 6. Routing
 
-- MUST include path and query string
-- Query parameters MUST be:
-  - Sorted lexicographically by key
-  - Percent-encoded per RFC 3986
+### 6.1 Namespace Isolation
 
-Example:
+All intents belong to a namespace. Workers MUST specify a namespace when claiming, defaulting to `default`.
 
-```
-/claim?goal=notify&publisher=tenant_a
-```
+Intents MUST NOT cross namespace boundaries.
+
+### 6.2 Visibility
+
+- `private` — only workers authenticated using the same API key as the publisher can claim the intent
+- `public` — any authenticated worker in the same namespace can claim the intent
+
+### 6.3 Priority
+
+Intents are claimed in descending priority order (higher value = higher priority). Within the same priority, intents are ordered by `run_at` ascending, then `claim_attempts` ascending.
+
+Priority scheduling does not guarantee fairness.
+
+### 6.4 Worker Targeting
+
+If `target_worker` is set on an intent, only a worker that presents a matching `X-Worker-ID` header (or `worker_id` query param) can claim it.
+
+### 6.5 Capability Matching
+
+If `required_capability` is set on an intent, only a worker that advertises the matching capability via `X-Worker-Capabilities` header (or `capabilities` query param, comma-separated) can claim it.
 
 ---
 
-## 5. Intent Object
+## 7. API Definition
 
-Returned when a job is successfully claimed:
+All regular endpoints require `X-API-KEY` authentication unless otherwise noted. Admin endpoints require admin authentication (Section 5.3). All responses use `Content-Type: application/json` unless otherwise noted.
+
+### 7.1 Health Check
+
+**GET /health**
+
+No authentication required.
+
+Response `200 OK`:
 
 ```json
-{
-  "id": "string",
-  "goal": "string",
-  "payload": {},
-  "claim_attempts": 1
-}
+{ "ok": true, "ts": 1234567890.0, "version": "7.5" }
 ```
 
----
-
-## 6. API Definition
-
----
-
-### 6.1 Create Intent
+### 7.2 Create Intent
 
 **POST /intent**
 
-Creates a new intent.
-
 #### Request
 
 ```json
 {
-  "goal": "string",
-  "payload": {},
-  "visibility": "string"
+  "goal": "send_notification",
+  "payload": { "message": "Hello" },
+  "namespace": "default",
+  "visibility": "private",
+  "priority": 100,
+  "delay": 0.0,
+  "max_attempts": 3,
+  "backoff_base": 5.0,
+  "target_worker": null,
+  "required_capability": null
 }
 ```
 
-#### Constraints
-
-- `goal` MUST be a non-empty string
-- `payload` MUST be a JSON object
-- `visibility` MAY be `"private"` or `"public"`
-- If omitted, server MUST default to `"private"`
+All fields except `goal` and `payload` are optional.
 
 #### Optional Header
 
-```
-Idempotency-Key: <UUID>
+```text
+Idempotency-Key: <string>
 ```
 
-#### Behavior
-
-- Server MUST ensure idempotency if header is present
-- Reuse of the same key with a different body MUST return `409 Conflict`
+If provided, the server MUST return the same response for the same key and body. Reuse of the same key with a different body MUST return `422 Unprocessable Entity`.
 
 #### Responses
 
-- `201 Created`
-- `400 Bad Request`
-- `409 Conflict`
+| Code | Meaning |
+|---|---|
+| `201 Created` | Intent published |
+| `400 Bad Request` | Missing or invalid fields |
+| `413 Payload Too Large` | Payload exceeds 8KB |
+| `422 Unprocessable Entity` | Idempotency key reused with different body |
+| `429 Too Many Requests` | Open intent limit reached or rate limited |
 
----
+Response body:
 
-### 6.2 Claim Intent
+```json
+{ "id": "<hex>", "status": "published", "namespace": "default" }
+```
+
+### 7.3 Claim Intent
 
 **POST /claim**
 
-Optional query:
+#### Query Parameters
 
-```
-?goal=<string>
-?publisher=<string>
-```
+| Param | Description |
+|---|---|
+| `goal` | Filter by goal string (optional) |
+| `namespace` | Target namespace (default: `"default"`) |
+| `publisher` | Filter by publisher key (admin only, or own key) |
+| `worker_id` | Fallback for X-Worker-ID header |
+| `capabilities` | Fallback for X-Worker-Capabilities header |
+
+#### Request Headers
+
+| Header | Description |
+|---|---|
+| `X-Worker-ID` | Worker identifier for `target_worker` matching |
+| `X-Worker-Capabilities` | Comma-separated capability list |
 
 #### Behavior
 
-- MUST atomically select and lock a job
-- MUST increment `claim_attempts`
-- MUST prioritize jobs by `claim_attempts` ascending
-- MUST only return jobs that are:
-  - `open`, OR
-  - `claimed` but expired
-- MUST only return jobs where:
-  - `visibility` is `"public"`, OR
-  - job belongs to the requesting API key
-- If `publisher` is provided, server MUST validate authorization
+The server MUST atomically select and lock the highest-priority eligible intent. Eligible intents are those where:
+
+- `status = 'open'` OR (`status = 'claimed'` AND lease expired)
+- `run_at <= now`
+- `expires_at > now`
+- `claim_attempts < max_attempts`
+- Namespace matches
+- Visibility or publisher matches
+- `target_worker` matches (if set)
+- `required_capability` is satisfied (if set)
+
+Selection order: `priority DESC`, `run_at ASC`, `claim_attempts ASC`, `created_at ASC`.
 
 #### Responses
 
-- `200 OK` (returns intent)
-- `204 No Content`
+| Code | Meaning |
+|---|---|
+| `200 OK` | Intent claimed |
+| `204 No Content` | No eligible intent (worker should back off and retry) |
 
----
+Response body on `200`:
 
-### 6.3 Fulfill Intent
+```json
+{
+  "id": "<hex>",
+  "namespace": "default",
+  "goal": "send_notification",
+  "payload": { "message": "Hello" },
+  "claim_attempts": 1,
+  "priority": 100,
+  "target_worker": null,
+  "required_capability": null,
+  "claim_timeout": 60
+}
+```
+
+The `204` response MUST include `Retry-After: 1`.
+
+### 7.4 Extend Claim
+
+**POST /extend_claim/<id>**
+
+Extends the lease on a currently-held intent. Workers performing long-running tasks SHOULD call this periodically to avoid the job being requeued.
+
+#### Request
+
+```json
+{ "seconds": 60 }
+```
+
+`seconds` MUST be between 10 and 3600.
+
+#### Responses
+
+| Code | Meaning |
+|---|---|
+| `200 OK` | Lease extended |
+| `404 Not Found` | Intent not found or not owned by caller |
+
+### 7.5 Fulfill Intent
 
 **POST /fulfill/<id>**
 
-#### Behavior
-
-- MUST transition intent to `fulfilled`
-- MUST only allow the claiming worker to fulfill
-
-#### Responses
-
-- `200 OK`
-- `404 Not Found`
-
----
-
-### 6.4 Fail Intent
-
-**POST /fail/<id>**
+Marks an intent as fulfilled. Optionally stores a result.
 
 #### Request
 
 ```json
 {
-  "error": "string"
+  "result": { "status": "sent" },
+  "result_type": "json"
 }
 ```
 
-#### Behavior
-
-- MUST transition intent to `failed`
-- SHOULD store error message (truncated if necessary)
+`result_type` MUST be `"json"` or `"text"`. If omitted, defaults to `"json"`. Body is optional — calling with no body marks fulfilled with no stored result.
 
 #### Responses
 
-- `200 OK`
-- `404 Not Found`
+| Code | Meaning |
+|---|---|
+| `200 OK` | Intent fulfilled |
+| `404 Not Found` | Not found or not the current claimer |
 
----
+### 7.6 Fail Intent
 
-## 7. Ephemeral Key-Value Store
+**POST /fail/<id>**
 
-A scoped key-value store for coordination between clients.
+Explicitly fails a claimed intent. The bus applies backoff and requeues if attempts remain, or moves to dead if exhausted.
 
-Keys MUST be isolated per API key.
+#### Request
 
----
+```json
+{ "error": "Connection timed out" }
+```
 
-### 7.1 Set Value
+#### Responses
+
+| Code | Meaning |
+|---|---|
+| `200 OK` | Processed |
+| `404 Not Found` | Not found or not the current claimer |
+
+### 7.7 Get Result
+
+**GET /result/<id>**
+
+Retrieves the stored result and full status of an intent. Accessible by the publisher, the claimer, or an admin.
+
+Response:
+
+```json
+{
+  "id": "<hex>",
+  "namespace": "default",
+  "goal": "send_notification",
+  "status": "fulfilled",
+  "priority": 100,
+  "visibility": "private",
+  "claim_attempts": 1,
+  "run_at": 1234567890.0,
+  "claim_expires_at": null,
+  "target_worker": null,
+  "required_capability": null,
+  "result_type": "json",
+  "result": { "status": "sent" },
+  "completed_at": 1234567890.0
+}
+```
+
+### 7.8 Get Status
+
+**GET /status/<id>**
+
+Lightweight status check without the result body. Same access control as `/result`.
+
+### 7.9 Ephemeral KV Store
+
+A scoped key-value store for lightweight coordination. Keys are isolated per API key.
 
 **POST /set/<key>**
 
 ```json
-{
-  "value": "string",
-  "ttl": 600
-}
+{ "value": "hello", "ttl": 600 }
 ```
 
-- `ttl` MUST be bounded by server limits
-
----
-
-### 7.2 Get Value
+`ttl` defaults to 600 seconds. Maximum 86400.
 
 **GET /get/<key>**
 
-Responses:
-
-- `200 OK`
-```json
-{ "value": "..." }
-```
-
-- `404 Not Found`
+Returns `200 { "value": "..." }` or `404`.
 
 ---
 
-## 8. Guarantees
+## 8. Admin API
+
+All admin endpoints require admin authentication (Section 5.3). Admin routes are exempt from tester rate limits and the open-intent cap.
+
+### 8.1 Dashboard
+
+**GET /admin/dashboard**
+
+Returns an HTML dashboard with live queue stats, recent intents, tester keys, and dead letters. Triggers browser Basic auth prompt if credentials are not provided.
+
+### 8.2 Key Management
+
+**POST /admin/generate_key**
+
+```json
+{ "owner": "alice" }
+```
+
+Returns `201 { "api_key": "tk_...", "owner": "alice" }`.
+
+**POST /admin/revoke_key**
+
+```json
+{ "api_key": "tk_..." }
+```
+
+Revokes the key and clears all associated rate limits, idempotency keys, and nonces.
+
+### 8.3 Purge
+
+**POST /admin/purge**
+
+```json
+{ "confirm": true, "namespace": "my-ns" }
+```
+
+`confirm: true` is required. `namespace` is optional — if omitted, purges all intents and housekeeping tables. If provided, purges only that namespace.
+
+### 8.4 Manual Cleanup
+
+**POST /admin/cleanup**
+
+Runs the background cleanup pass immediately. Returns stats:
+
+```json
+{
+  "expired_open_deleted": 0,
+  "expired_claims_requeued": 0,
+  "expired_claims_dead": 0,
+  "fulfilled_deleted": 0,
+  "dead_deleted": 0,
+  "dead_letters_deleted": 0,
+  "store_deleted": 0,
+  "rate_limits_deleted": 0,
+  "idempotency_deleted": 0,
+  "nonces_deleted": 0
+}
+```
+
+### 8.5 Intent Management
+
+**GET /admin/intents/<id>** — Full intent detail including payload.
+
+**POST /admin/intents/<id>/cancel** — Forces intent to `dead` and archives to dead-letter queue.
+
+**POST /admin/intents/<id>/retry** — Resets a `dead` intent to `open` with `claim_attempts = 0`.
+
+### 8.6 Dead Letter Queue
+
+**GET /admin/dead** — Lists the 100 most recent dead letters.
+
+**GET /admin/dead/<intent_id>** — Full detail for a dead letter including original payload.
+
+---
+
+## 9. Metrics
+
+**GET /metrics**
+
+Requires either a `Bearer <METRICS_TOKEN>` Authorization header, or admin credentials.
+
+Returns Prometheus-compatible text format:
+
+```text
+# HELP intent_bus_intents_total Total intents by status and namespace
+# TYPE intent_bus_intents_total gauge
+intent_bus_intents_total{status="open",namespace="default"} 3
+intent_bus_intents_total{status="claimed",namespace="default"} 1
+# HELP intent_bus_dead_letters_total Total dead-letter intents
+# TYPE intent_bus_dead_letters_total gauge
+intent_bus_dead_letters_total 0
+# HELP intent_bus_tester_keys_total Total active tester keys
+# TYPE intent_bus_tester_keys_total gauge
+intent_bus_tester_keys_total 2
+```
+
+---
+
+## 10. Response Headers
+
+All responses MUST include:
+
+| Header | Value |
+|---|---|
+| `X-Frame-Options` | `DENY` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Referrer-Policy` | `no-referrer` |
+| `Cache-Control` | `no-store` |
+| `X-Intent-Version` | Server protocol version |
+
+---
+
+## 11. Error Format
+
+All error responses MUST use the following shape:
+
+```json
+{
+  "error": {
+    "code": "snake_case_code",
+    "message": "Human-readable description."
+  }
+}
+```
+
+Common error codes:
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `unauthorized` | 401 | Missing or invalid API key |
+| `forbidden` | 403 | Valid key but insufficient permission |
+| `not_found` | 404 | Intent or resource not found |
+| `invalid_request` | 400 | Missing required fields |
+| `invalid_payload` | 400 | Malformed payload |
+| `payload_too_large` | 413 | Payload exceeds 8KB |
+| `idempotency_conflict` | 422 | Key reused with different body |
+| `rate_limited` | 429 | Too many requests |
+| `limit_exceeded` | 429 | Open intent cap reached |
+| `database_busy` | 503 | SQLite contention |
+| `maintenance` | 503 | Server in maintenance mode |
+
+---
+
+## 12. Guarantees
 
 Implementations MUST provide:
 
 - At-least-once delivery
 - Atomic job claiming
-- Retry on failure
-- Poison pill protection
-- Per-key isolation
+- Retry with exponential backoff
+- Dead-letter archival after max attempts
+- Per-namespace and per-key isolation
 
 ---
 
-## 9. Non-Goals
+## 13. Non-Goals
 
 The protocol does NOT guarantee:
 
@@ -366,41 +658,61 @@ The protocol does NOT guarantee:
 
 ---
 
-## 10. Security Considerations
+## 14. Server Configuration
 
-- API keys MUST be kept secret
-- HTTPS MUST be enforced
-- Replay attacks MUST be mitigated (Strict Auth)
-- Servers SHOULD implement rate limiting
-- Servers SHOULD enforce payload size limits
-- Servers SHOULD validate input types
-
----
-
-## 11. Implementation Notes
-
-- SQLite is sufficient for single-node deployments
-- Locking SHOULD be transactional and atomic (e.g., `BEGIN IMMEDIATE` with `RETURNING`)
-- Cleanup of expired jobs SHOULD be periodic
-- Systems SHOULD handle database contention gracefully
+| Environment Variable | Default | Description |
+|---|---|---|
+| `BUS_SECRET` | — | Main API key. Required in production. |
+| `BUS_ADMIN_SECRET` | — | Admin token secret. Falls back to `BUS_SECRET` if unset. |
+| `DASHBOARD_PASSWORD` | — | HTTP Basic auth password for dashboard. |
+| `BUS_METRICS_TOKEN` | — | Bearer token for `/metrics`. |
+| `BUS_DB_PATH` | `infrastructure.db` | Path to the SQLite database file. |
+| `BUS_TRUST_PROXY` | `false` | Enable ProxyFix for X-Forwarded-For. |
+| `BUS_ENFORCE_HTTPS` | `false` | Reject non-HTTPS requests. |
+| `BUS_REQUIRE_SIGNATURES` | `false` | Require HMAC signing on all requests. |
+| `BUS_MAINTENANCE_MODE` | `false` | Block all non-admin traffic. |
+| `BUS_CLEANUP_INTERVAL_SECONDS` | `21600` | Minimum seconds between cleanup passes. 300–86400. |
 
 ---
 
-## 12. Versioning
+## 15. Security Considerations
 
-- Version: 1.1
-- Breaking changes MUST increment major version
+- `BUS_SECRET` MUST be kept secret and MUST NOT be the default `dev_secret` in production
+- HTTPS MUST be enforced in production (`BUS_ENFORCE_HTTPS=true` or proxy-level TLS)
+- Replay attacks are mitigated by Strict Auth (nonce + timestamp window)
+- Rate limiting: 60 requests/minute per tester key
+- Payload size limit: 8KB per intent
+- Open intent cap: 100 per tester key (admin exempt)
+- Dead letters are retained for 7 days
+- Fulfilled intents are retained for 7 days
+
+---
+
+## 16. Implementation Notes
+
+- SQLite WAL mode is required; `journal_mode` must be set to `WAL`
+- Atomic claiming MUST use `BEGIN IMMEDIATE` with `UPDATE ... RETURNING`
+- Cleanup is lazy: triggered by request traffic, not a background thread
+- Multiple gunicorn workers will cause SQLite write contention; use `--workers 1 --threads N`
+
+---
+
+## 17. Versioning
+
+- Version: 2.0
+- Breaking changes MUST increment the major version
 - Additive changes SHOULD be backward-compatible
+- The current protocol version is advertised in the `X-Intent-Version` response header
 
 ---
 
-## 13. Compatibility
+## 18. Compatibility
 
 An implementation is compliant if it:
 
-- Implements required endpoints
-- Enforces authentication rules
-- Maintains lifecycle and routing guarantees
+- Implements all required endpoints in Sections 7 and 8
+- Enforces authentication rules in Section 5
+- Maintains lifecycle and routing guarantees in Sections 3 and 6
 
 ---
 
