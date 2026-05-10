@@ -1,11 +1,11 @@
 # Contributing to Intent Bus
 
-First off — thank you for considering contributing. 🙌 
+First off — thank you for considering contributing. 🙌  
 Intent Bus grows through community ideas, diverse workers, and protocol improvements.
 
 ---
 
-##  Philosophy
+## Philosophy
 
 Intent Bus is built on three core principles:
 
@@ -26,7 +26,7 @@ We strongly prefer:
 * Native SQLite features (WAL, RETURNING)
 * Simple, inspectable, single-file logic
 
-### 3. At-Least-Once is Law
+### 3. At-Least-Once Delivery is Fundamental
 We prioritize reliability over performance.
 * Jobs MUST NOT be lost.
 * Retries are expected and native to the bus.
@@ -49,18 +49,19 @@ We will:
 
 ---
 
-##  Ways to Contribute
+## Ways to Contribute
 
 ### 1. Build a Worker (Best First Contribution)
-Workers are what make the bus useful. 
-* Add your script to the `examples/` directory.
+Workers are what make the bus useful.
+* Add your script to the `Examples/` directory.
 * Use a clear, descriptive name (e.g., `telegram_worker.py`, `sms_worker.sh`).
 * Explore both private tasks and **public intents (Open Fleet)**.
 
 **Worker Requirements:**
 * MUST handle duplicate execution safely (idempotency).
-* MUST implement retry logic with backoff.
-* MUST respect the `CLAIM_TIMEOUT` window.
+* MUST tolerate retries and backoff from the bus.
+* MUST respect the `claim_timeout` window.
+* MUST utilize capability routing (`X-Worker-Capabilities`) if executing specialized tasks.
 * MUST mark successful execution via `POST /fulfill/<id>`.
 * MUST report failures via `POST /fail/<id>`.
 
@@ -76,18 +77,19 @@ Want Intent Bus in Go, Rust, or TypeScript? Use the protocol spec (`SPEC.md`) as
 
 ---
 
-##  Development Setup
+## Development Setup
 
-**Requirement:** SQLite 3.35.0+ is required (for the atomic `RETURNING` clause). 
+**Requirement:** SQLite 3.35.0+ is required (for the atomic `RETURNING` clause).  
 Check your version with:
+
 ```bash
 python -c "import sqlite3; print(sqlite3.sqlite_version)"
 ```
 
 ```bash
-git clone https://github.com/dsecurity/Intent-Bus.git
+git clone https://github.com/dsecurity49/Intent-Bus.git
 cd Intent-Bus
-pip install -r requirements.txt
+pip install -r server-requirements.txt
 ```
 
 ### Set Environment Variables
@@ -106,52 +108,60 @@ setx BUS_SECRET "dev_key_here"
 ```bash
 python flask_app.py
 ```
+
 The server will boot at: `http://localhost:5000`
+
+**Note:** WAL mode MUST be enabled during testing.
 
 ---
 
-##  Testing Guidelines
+## Testing Guidelines
 
 Before submitting a Pull Request, verify your changes against the core protocol loops:
 
-**1. Standard Auth Test (Publishing)**
+### 1. Standard Auth Test (Publishing)
+
 ```bash
 curl -X POST http://localhost:5000/intent \
   -H "X-API-KEY: dev_key_here" \
   -H "Content-Type: application/json" \
-  -d '{"goal":"test", "visibility":"public", "payload":{"msg":"hello"}}'
+  -d '{"goal":"test","visibility":"public","payload":{"msg":"hello"}}'
 ```
 
-**2. Claim Flow Test (Consuming)**
+### 2. Claim Flow Test (Consuming)
+
 ```bash
 curl -X POST "http://localhost:5000/claim?goal=test" \
   -H "X-API-KEY: dev_key_here"
 ```
 
-**3. Concurrency Test (CRITICAL)**
+### 3. Concurrency Test (CRITICAL)
+
 Run multiple workers simultaneously and verify:
 * No duplicate claims for the same intent.
 * Lock contention (`SQLITE_BUSY`) degrades gracefully.
 * Synchronous garbage collection does not trigger SQLITE_BUSY timeouts.
 
-**4. Security Checks**
+### 4. Security Checks
+
 Verify:
 * Invalid HMAC signatures are rejected.
 * Replay attacks fail (timestamps are within the 300s window).
-* Rate limits trigger correctly (60 requests/min).
+* Rate limits trigger correctly. *(Note: the main `BUS_SECRET` bypasses rate limits. You must generate a tester key via `POST /admin/generate_key` to test the 60 requests/min throttle.)*
 
 ---
 
-##  Pull Request Rules
+## Pull Request Rules
 
 * **Focus:** One feature or fix per PR. Keep diffs small.
 * **Style:** Follow PEP-8. Keep it clean and release-grade.
 * **Dependencies:** Do NOT introduce external libraries without opening an issue for discussion first.
 * **Backward Compatibility:** Do NOT break existing API behavior.
+* **Protocol Changes:** Protocol-affecting changes MUST update `SPEC.md`.
 
 ---
 
-##  Versioning & Compatibility
+## Versioning & Compatibility
 
 API changes MUST be backward compatible. If a breaking change is completely unavoidable:
 * It MUST be optional/opt-in where possible.
@@ -161,15 +171,25 @@ API changes MUST be backward compatible. If a breaking change is completely unav
 
 ---
 
-##  Discussions & Help
+## Discussions & Help
 
 For large architectural ideas or protocol changes, please open an Issue first to hash out the design.
 
-* **Dev.to Blog:** [dev.to/d_security](https://dev.to/d_security)
-* **Discord:** [Join the Community](https://discord.gg/bzAneAQzGX)
+* **Dev.to Blog:** https://dev.to/d_security
+* **Discord:** https://discord.gg/bzAneAQzGX
 
 ---
 
-##  License
+## Security & Secrets
+
+Never commit:
+* Real API keys
+* Production secrets
+* SQLite database files
+* `.env` files containing credentials
+
+---
+
+## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
