@@ -135,7 +135,7 @@ Workers are selected using:
 - `namespace`
 - `X-Worker-Capabilities`
 
-Future routing extensions may include priority weighting.
+Workers are selected by: goal, namespace, X-Worker-Capabilities, X-Worker-ID, and priority (higher values claimed first).
 
 ---
 
