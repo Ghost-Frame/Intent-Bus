@@ -398,6 +398,9 @@ Extends the lease on a currently-held intent. Workers performing long-running ta
 | `200 OK` | Lease extended |
 | `404 Not Found` | Intent not found or not owned by caller |
 
+A lease extension MUST fail if the existing lease has already expired.
+Workers MUST call `/claim` again to re-acquire the intent.
+
 ### 7.5 Fulfill Intent
 
 **POST /fulfill/<id>**
