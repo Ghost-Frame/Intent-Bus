@@ -1,36 +1,52 @@
 # Use a slim Python image for a small footprint
 FROM python:3.11-slim
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV BUS_DB_PATH=/app/data/infrastructure.db
+# Environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONHASHSEED=random \
+    BUS_DB_PATH=/app/data/infrastructure.db
 
-# Create and set the working directory
+# Create non-root user
+RUN useradd -r -s /usr/sbin/nologin intentbus
+
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies (SQLite 3.35+ required for RETURNING clause)
-RUN apt-get update && apt-get install -y \
+# Install required system packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install production server and dependencies
-RUN pip install --no-cache-dir Flask werkzeug gunicorn
+# Install Python dependencies
+COPY server-requirements.txt .
+RUN pip install --no-cache-dir -r server-requirements.txt
 
-# Copy the server script
-COPY flask_app.py app.py
+# Copy application files
+COPY flask_app.py .
 
-# Create directory for persistent database storage
-RUN mkdir -p /app/data
+# Persistent SQLite storage directory
+RUN mkdir -p /app/data && chown -R intentbus:intentbus /app
 
-# Expose the standard port
+# Drop root privileges
+USER intentbus
+
+# Expose service port
 EXPOSE 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s \
-    CMD curl -f http://localhost:8080/ || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -f http://127.0.0.1:8080/health || exit 1
 
-# Single worker + threads keeps SQLite's single-writer model intact.
-# Multiple workers = multiple processes = write contention on SQLite.
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "app:app"]
+# SQLite is single-writer; use one Gunicorn worker process.
+# Threads are acceptable because SQLite serializes writes internally.
+CMD ["gunicorn", \
+     "--bind", "0.0.0.0:8080", \
+     "--workers", "1", \
+     "--threads", "4", \
+     "--timeout", "120", \
+     "--graceful-timeout", "30", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "flask_app:app"]
