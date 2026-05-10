@@ -1,104 +1,176 @@
-# Intent Bus Examples
+# Intent Bus Examples (v7.5)
 
-This directory contains **reference worker implementations** for the Intent Bus.
+This directory contains **reference worker implementations** for the Intent Bus v7.5 protocol.
 
-Each example shows how to:
-- Claim an intent
-- Execute a task locally
-- Fulfill or fail the job
+Workers are **active execution agents**, not passive clients.
 
-> Workers are part of the protocol — not just clients. Incorrect worker behavior can break system guarantees.
+Incorrect worker behavior breaks:
+- delivery guarantees
+- at-least-once execution safety
+- routing consistency
 
 ---
 
-##  Prerequisites
+## Core v7.5 Model
 
-Store your API key locally:
+Intent Bus uses:
+
+- `goal` → intent type (what to do)
+- `namespace` → routing isolation boundary
+- `capabilities` → worker eligibility filter
+- `worker-id` → identity binding
+
+Workers must:
+- claim → execute → fulfill/fail
+- never silently drop jobs
+
+---
+
+## Prerequisites
+
+### API Key (required)
 
 ```bash
 echo "your_api_key_here" > ~/.apikey
+chmod 600 ~/.apikey
 ```
 
 ---
 
-##  Bash Workers (`.sh`)
+## Bash Workers (.sh)
 
-**Auth Mode:** Standard (API Key Header)  
-**Dependencies:** `curl`, `jq`
+**Auth Mode:** API Key Header  
+**Runtime:** POSIX / BusyBox compatible  
+**Dependencies:** curl, jq
 
-### Install Dependencies
+### Install
 
-**Termux**
+#### Termux
 ```bash
 pkg install curl jq
 ```
 
-**Linux**
+#### Linux
 ```bash
 sudo apt install curl jq
 ```
 
-### Available
+---
 
-- `worker.sh` → Sends notifications (Termux)
-- `logger.sh` → Logs events to file
-- `discord_worker.sh` → Sends messages to Discord
+## Available Workers
+
+### 1. Notification Worker
+- Executes mobile notifications
+- Uses Termux API
+- Safe UI truncation enforced
+
+### 2. Logging Worker
+- Writes structured logs to file
+- Supports persistent audit trails
+
+### 3. Integration Workers
+- Discord / external webhook workers
+- Extendable execution adapters
 
 ---
 
-##  Python Workers (`.py`)
+## Running Workers
 
-**Auth Mode:** Strict (HMAC via SDK)
+Before running, configure:
 
-Install the SDK:
-
-```bash
-pip install intent-bus
-```
-
-### Available
-
-- `python_worker.py` → Demonstrates controlled execution with strict validation (safe command patterns)
-
----
-
-##  Running an Example
-
-### Bash
+- `GOAL`
+- `NAMESPACE`
+- `WORKER_ID`
+- `CAPABILITIES`
 
 ```bash
 chmod +x worker.sh
 ./worker.sh
 ```
 
-### Python
+---
 
-```bash
-python python_worker.py --goal sys
+## v7.5 Protocol Rules
+
+### 1. Completion Requirement
+Workers MUST call:
+- `/fulfill/<id>` on success
+- `/fail/<id>` on execution error
+
+Silent drop = protocol violation
+
+---
+
+### 2. At-Least-Once Delivery
+Jobs may be retried.
+
+Workers MUST ensure:
+- idempotent execution logic
+- safe re-runs without side effects
+
+---
+
+### 3. Idle Handling
+Server may respond:
+
+```text
+204 No Content
 ```
 
----
+Optional header:
 
-## ⚠️ Notes & Rules
+```text
+Retry-After: <seconds>
+```
 
-- **Completion is mandatory:** Workers MUST call `/fulfill/<id>` on success.
-- **Failure reporting is mandatory:** Workers MUST call `/fail/<id>` on any execution error.
-- Silent drops are considered protocol violations.
-
-- **Idempotency:** Jobs may be retried (at-least-once delivery). Execution logic MUST be safe to run multiple times.
-
-- **Hybrid Routing:** By default, workers claim private intents. You may modify these examples to claim `visibility="public"` intents.
-
-⚠️ **Security Warning (Open Fleet):**  
-If a worker claims public intents, payloads MUST be treated as untrusted input.  
-Refer to `WORKER_SECURITY.md` before enabling public execution.
+Workers MUST respect this when present.
 
 ---
 
-##  Required Reading
+### 4. Routing Model (v7.5)
 
-- `SPEC.md` → Protocol definition and state machine  
-- `WORKER_SECURITY.md` → Critical security rules for executing payloads  
+Workers are selected using:
+
+- `goal`
+- `namespace`
+- `X-Worker-Capabilities`
+
+Future routing extensions may include priority weighting.
+
+---
+
+### 5. Security Model
+
+Workers MUST treat payloads as:
+- untrusted input
+- execution-sensitive data
+
+Refer to:
+- `WORKER_SECURITY.md`
+
+---
+
+## Python Workers
+
+**Auth Mode:** HMAC (strict validation)
+
+```bash
+pip install intent-bus
+```
+
+Python workers enforce:
+- signed intents
+- validated execution schema
+- stricter safety guarantees than Bash workers
+
+---
+
+## Important Design Principle
+
+Intent Bus workers are:
+> "edge execution nodes in a distributed intent system"
+
+They are not scripts — they are **stateful execution participants**.
 
 ---
 
