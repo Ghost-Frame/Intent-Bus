@@ -31,7 +31,7 @@ No external brokers. Just a minimal Flask + SQLite core.
 2. Workers **poll `/claim`** for matching jobs
 3. One worker **atomically claims** the job (`BEGIN IMMEDIATE` + `UPDATE ... RETURNING`)
 4. Worker executes and calls `/fulfill`
-5. If it crashes → job is **requeued with exponential backoff** and retried up to 3 times before being archived to the **dead-letter queue**
+5. If it crashes, the job is **requeued with exponential backoff** and retried up to `max_attempts` times before being archived to the **dead-letter queue**
 
 ```mermaid
 graph LR
@@ -71,7 +71,7 @@ Intent Bus supports two auth modes for regular clients and a separate admin auth
 
 ### Standard Auth
 
-```bash
+```text
 X-API-KEY: your_key_here
 ```
 
@@ -105,21 +105,20 @@ pip install intent-bus
 
 ### Publish a job
 
+`publish()` returns an `IntentStatus` model.
+
 ```python
 from intent_bus import IntentClient
 
-client = IntentClient(api_key="your_key_here")
-
-job = client.publish(
-    goal="send_notification",
-    payload={"message": "Hello from the cloud"},
-    idempotency_key="task_123",  # Prevents double-execution on retry
-    # visibility="public",       # Any worker in this namespace can claim it
-    # priority=500,              # Higher = claimed first (0–1000, default 100)
-    # delay=30.0,                # Wait 30s before becoming claimable
-)
-
-print(job["id"])
+# Use as a context manager for automatic connection pooling cleanup
+with IntentClient(api_key="your_key_here") as client:
+    published = client.publish(
+        goal="send_notification",
+        payload={"instruction": "Hello from the cloud"},
+        idempotency_key="task_123",  # Prevents double-execution on retry
+        priority=500,               # Higher = claimed first (0–1000, default 100)
+    )
+    print(f"Published: {published.id}")
 ```
 
 **Job Visibility:**
@@ -132,15 +131,22 @@ print(job["id"])
 
 ### Run a worker
 
+`claim()` returns a `ClaimResponse[ClaimedIntent]`. Use `job.id` and `job.payload` in handlers.
+
 ```python
-from intent_bus import IntentClient
+from intent_bus import IntentClient, WorkerRuntime
 
 def handler(payload):
-    print("Received:", payload["message"])
-    return {"status": "delivered"}
+    # payload is the dict passed to publish()
+    print("Received:", payload.get("instruction"))
+    # Return a dict for fulfillment; the SDK handles the /fulfill call
+    return {"result": "delivered", "result_type": "text"}
 
 client = IntentClient(api_key="your_key_here")
-client.listen(goal="send_notification", handler=handler)
+runtime = WorkerRuntime(client=client)
+
+# Resilient v2.0 loop with exponential backoff and jitter
+runtime.listen(goal="send_notification", handler=handler)
 ```
 
 > ⚠️ **Workers must be idempotent.** The same job may be delivered more than once if:
@@ -161,7 +167,7 @@ client.listen(goal="send_notification", handler=handler)
 curl -X POST https://dsecurity.pythonanywhere.com/intent \
   -H "Content-Type: application/json" \
   -H "X-API-KEY: your_key_here" \
-  -d '{"goal":"send_notification","payload":{"message":"Hello"}}'
+  -d '{"goal":"send_notification","payload":{"instruction":"Hello"}}'
 ```
 
 ### Publish with priority and delay
@@ -170,30 +176,32 @@ curl -X POST https://dsecurity.pythonanywhere.com/intent \
 curl -X POST https://dsecurity.pythonanywhere.com/intent \
   -H "Content-Type: application/json" \
   -H "X-API-KEY: your_key_here" \
-  -d '{"goal":"send_notification","payload":{"message":"Urgent"},"priority":900,"delay":5.0}'
+  -d '{"goal":"send_notification","payload":{"instruction":"Urgent"},"priority":900,"delay":5.0}'
 ```
 
 ### Claim and fulfill
 
 ```bash
-# Claim
+# Claim (returns a JSON intent model in v2.0)
 curl -s -X POST "https://dsecurity.pythonanywhere.com/claim?goal=send_notification" \
   -H "X-API-KEY: your_key_here"
 
-# Fulfill
+# Fulfill (v2.0 requires result_type)
 curl -s -X POST "https://dsecurity.pythonanywhere.com/fulfill/<INTENT_ID>" \
-  -H "X-API-KEY: your_key_here"
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: your_key_here" \
+  -d '{"result":"done","result_type":"text"}'
 ```
 
 If a job isn't fulfilled within 60 seconds, it is automatically requeued with exponential backoff.
 
-> **Worker polling:** After a `204 No Content` (no jobs available), workers SHOULD wait 0.5–2 seconds before polling again. Tight polling loops create unnecessary write pressure on SQLite under concurrency.
+> **Worker polling:** After a `204 No Content` (no jobs available), workers SHOULD wait for the `Retry-After` duration (default 1s). Tight polling loops create unnecessary write pressure on SQLite under concurrency.
 
 ---
 
 ## Job Lifecycle
 
-```
+```text
 open ──► claimed ──► fulfilled
                 │
                 ▼
@@ -218,7 +226,7 @@ Send a job directly to one named machine — useful when a task must run on a pa
 ```python
 client.publish(
     goal="run_backup",
-    payload={"path": "/data"},
+    payload={"instruction": "/data"},
     target_worker="termux-phone-1",   # only this worker can claim it
 )
 ```
@@ -226,7 +234,7 @@ client.publish(
 The worker declares its ID at claim time:
 
 ```bash
-curl -X POST ".../claim?goal=run_backup" \
+curl -X POST "https://dsecurity.pythonanywhere.com/claim?goal=run_backup" \
   -H "X-API-KEY: key" \
   -H "X-Worker-ID: termux-phone-1"
 ```
@@ -238,21 +246,15 @@ Route jobs to any worker that advertises the right capability — useful when yo
 ```python
 client.publish(
     goal="transcribe_audio",
-    payload={"file": "meeting.mp3"},
+    payload={"instruction": "meeting.mp3"},
     required_capability="whisper",
-)
-
-client.publish(
-    goal="render_video",
-    payload={"scene": "intro.blend"},
-    required_capability="gpu",
 )
 ```
 
 Workers declare their capabilities at claim time:
 
 ```bash
-curl -X POST ".../claim" \
+curl -X POST "https://dsecurity.pythonanywhere.com/claim" \
   -H "X-API-KEY: key" \
   -H "X-Worker-Capabilities: whisper,ffmpeg,gpu"
 ```
@@ -274,21 +276,21 @@ Both fields can be combined. A job with `target_worker` and `required_capability
 ## Features
 
 - **Reliable Delivery** — jobs retried with exponential backoff up to `max_attempts`
-- **Atomic Locking** — `BEGIN IMMEDIATE` prevents double-claiming under concurrency
+- **Atomic Locking** — `BEGIN IMMEDIATE` + `RETURNING` prevents double-claiming
 - **Dead-Letter Queue** — exhausted jobs archived for inspection and one-click retry
 - **Priority Scheduling** — higher-priority intents always claimed before lower ones
-- **Namespace Isolation** — partition workloads across logical domains without separate servers
-- **Worker Targeting** — route a job directly to a named worker via `target_worker`
+- **Namespace Isolation** — partition workloads across logical domains
+- **Worker Targeting** — route a job directly to a named worker
 - **Capability Matching** — require specific capabilities for specialized tasks
 - **Delayed Execution** — publish now, make claimable later with `delay`
-- **Result Storage** — workers store structured results; publishers poll `/result/<id>`
+- **Result Storage** — workers store structured results (json/text); publishers poll `/result/<id>`
 - **Idempotency Keys** — safe publisher retries with no duplicate jobs
 - **Hybrid Visibility** — private by default, optionally open to the whole namespace
 - **Rate Limiting** — 60 req/min per tester key, enforced per API key
 - **Ephemeral KV Store** — `/set` and `/get` with configurable TTL
-- **Lazy Cleanup** — triggered by traffic, no background thread or scheduler required
-- **HMAC Signing** — optional replay-protected auth, enforceable globally
-- **Admin Dashboard** — live queue stats, dead letters, key management at `/admin/dashboard`
+- **Lazy Cleanup** — triggered by traffic, no background thread required
+- **HMAC Signing** — optional replay-protected auth, handled by v2.0 SDK
+- **Admin Dashboard** — live queue stats and management at `/admin/dashboard`
 - **Prometheus Metrics** — `/metrics` with intent counts by status and namespace
 
 ---
@@ -328,53 +330,12 @@ cd Intent-Bus
 pip install -r server-requirements.txt
 ```
 
-Configure your WSGI file:
-
-```python
-import os
-
-os.environ["BUS_SECRET"]                   = "your_strong_secret"
-os.environ["BUS_ADMIN_SECRET"]             = "your_separate_admin_secret"
-os.environ["BUS_METRICS_TOKEN"]            = "your_metrics_token"
-os.environ["BUS_DB_PATH"]                  = "/home/youruser/intentbus/infrastructure.db"
-os.environ["BUS_TRUST_PROXY"]              = "true"
-os.environ["BUS_CLEANUP_INTERVAL_SECONDS"] = "21600"
-os.environ["BUS_REQUIRE_SIGNATURES"]       = "false"
-os.environ["BUS_MAINTENANCE_MODE"]         = "false"
-
-from flask_app import app as application
-```
-
 ### Option 2 — Docker
-
-> **Production note:** Run behind nginx, Caddy, or another reverse proxy that terminates HTTPS. Set `BUS_TRUST_PROXY=true` so the app correctly reads the forwarded client IP. PythonAnywhere handles this automatically.
 
 ```bash
 git clone https://github.com/dsecurity49/Intent-Bus
 cd Intent-Bus
 docker-compose up -d
-```
-
-Edit `docker-compose.yml` to set your secrets before running.
-
-> **SQLite note:** The `bus_data` volume must be on local storage. NFS, EFS, or network drives cause WAL locking issues.
-> If you see "read-only database" on first run: `mkdir -p bus_data && chmod 777 bus_data`
-
-### Worker (Termux / Linux)
-
-```bash
-# Termux
-pkg install jq curl
-
-# Linux
-sudo apt install jq curl
-```
-
-```bash
-echo "your_key_here" > ~/.apikey
-chmod 600 ~/.apikey
-chmod +x worker.sh
-./worker.sh
 ```
 
 ---
@@ -384,15 +345,11 @@ chmod +x worker.sh
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BUS_SECRET` | — | Main API key. **Required in production.** |
-| `BUS_ADMIN_SECRET` | — | Admin token (`X-Admin-Token`). Falls back to `BUS_SECRET` if unset. |
-| `DASHBOARD_PASSWORD` | — | HTTP Basic auth password for the admin dashboard. |
-| `BUS_METRICS_TOKEN` | — | Bearer token for Prometheus `/metrics` scraping. |
+| `BUS_ADMIN_SECRET` | — | Admin token. Falls back to `BUS_SECRET` if unset. |
+| `DASHBOARD_PASSWORD` | — | Basic auth password for the admin dashboard. |
 | `BUS_DB_PATH` | `infrastructure.db` | Path to the SQLite database file. |
-| `BUS_TRUST_PROXY` | `false` | Enable ProxyFix. Set `true` behind nginx, Caddy, or PythonAnywhere. |
-| `BUS_ENFORCE_HTTPS` | `false` | Reject non-HTTPS requests at the application level. |
 | `BUS_REQUIRE_SIGNATURES` | `false` | Require HMAC signing on all client requests. |
-| `BUS_MAINTENANCE_MODE` | `false` | Block all non-admin traffic with `503`. |
-| `BUS_CLEANUP_INTERVAL_SECONDS` | `21600` | Minimum seconds between automatic cleanup passes (300–86400). |
+| `BUS_CLEANUP_INTERVAL_SECONDS` | `21600` | Seconds between automatic cleanup passes. |
 
 ---
 
@@ -400,56 +357,14 @@ chmod +x worker.sh
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/` | None | Version string |
-| `GET` | `/health` | None | Health check |
 | `POST` | `/intent` | API key | Publish a job |
 | `POST` | `/claim` | API key | Claim a job |
-| `POST` | `/extend_claim/<id>` | API key | Extend the lease on a claimed job |
-| `POST` | `/fulfill/<id>` | API key | Mark a job complete, optionally store result |
+| `POST` | `/fulfill/<id>` | API key | Mark job complete (v2.0 requires result_type) |
 | `POST` | `/fail/<id>` | API key | Fail a job (triggers retry or dead) |
 | `GET` | `/result/<id>` | API key | Get stored result and full status |
-| `GET` | `/status/<id>` | API key | Lightweight status check |
 | `POST` | `/set/<key>` | API key | Set a KV store entry with TTL |
 | `GET` | `/get/<key>` | API key | Get a KV store entry |
-| `GET` | `/metrics` | Token or admin | Prometheus-format metrics |
-| `GET` | `/admin/dashboard` | Admin | Live queue dashboard (HTML) |
-| `POST` | `/admin/generate_key` | Admin | Create a tester key |
-| `POST` | `/admin/revoke_key` | Admin | Revoke a tester key and clear its data |
-| `POST` | `/admin/purge` | Admin | Purge intents (namespace-scoped or full) |
 | `POST` | `/admin/cleanup` | Admin | Run cleanup manually, returns stats |
-| `GET` | `/admin/intents/<id>` | Admin | Full intent detail including payload |
-| `POST` | `/admin/intents/<id>/cancel` | Admin | Force intent to dead |
-| `POST` | `/admin/intents/<id>/retry` | Admin | Reset dead intent to open |
-| `GET` | `/admin/dead` | Admin | List dead letters |
-| `GET` | `/admin/dead/<id>` | Admin | Dead letter detail with original payload |
-
----
-
-## Try It Live
-
-```
-https://dsecurity.pythonanywhere.com
-```
-
-To get a tester key, open a thread in [GitHub Discussions](https://github.com/dsecurity49/Intent-Bus/discussions) or join the [Discord](https://discord.gg/bzAneAQzGX).
-
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `flask_app.py` | Core server (single file) |
-| `worker.sh` | Termux notification worker |
-| `logger.sh` | Logging worker |
-| `server-requirements.txt` | Python dependencies |
-| `Dockerfile` | Container setup |
-| `docker-compose.yml` | Docker Compose deployment |
-| `Examples/` | Reference workers (Discord, Python) |
-| `SPEC.md` | Intent Protocol v2.0 specification |
-| `SECURITY.md` | Threat model and key rotation guide |
-| `WORKER_SECURITY.md` | Worker security standard |
-| `CONTRIBUTING.md` | Contribution guidelines |
 
 ---
 
