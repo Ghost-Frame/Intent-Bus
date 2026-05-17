@@ -1,0 +1,92 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+*.dist
+
+# =========================
+# Virtual Environments
+# =========================
+.env
+.env.*
+!.env.example
+.venv
+env/
+venv/
+ENV/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+*.log
+bus_logs.txt
+
+# =========================
+# Intent Bus Runtime Data
+# =========================
+infrastructure.db
+infrastructure.db-wal
+infrastructure.db-shm
+*-wal
+*-shm
+
+# Avoid blanket DB ignores (safer for tests)
+# *.db
+# *.sqlite
+# *.sqlite3
+
+# =========================
+# Secrets (CRITICAL)
+# =========================
+.apikey
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.secrets
+.envrc
+
+# =========================
+# Testing / Coverage
+# =========================
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# =========================
+# Node (future-proofing)
+# =========================
+node_modules/
+
+# =========================
+# Misc
+# =========================
+*.tmp
+*.bak
